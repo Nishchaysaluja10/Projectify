@@ -1,16 +1,15 @@
 import sqlite3
 
 def init_db():
-    """Creates the database and the required table if they don't exist."""
     conn = sqlite3.connect('architecture_map.db')
     cursor = conn.cursor()
-    
-    # Create a table to store our AI-analyzed functions
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS functions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            repository_url TEXT,
+            repo_url TEXT,
             file_name TEXT,
+            file_type TEXT,        -- NEW: python, vue, sql, config
+            function_name TEXT, 
             function_code TEXT,
             ai_summary TEXT
         )
@@ -18,15 +17,16 @@ def init_db():
     conn.commit()
     conn.close()
 
-def save_to_db(repo_url, file_name, code, ai_summary):
-    """Inserts a processed function into the database."""
+# ✅ FIXED: Added file_type as a parameter to match the table schema
+def save_to_db(repo_url, file_name, file_type, function_name, function_code, ai_summary):
     conn = sqlite3.connect('architecture_map.db')
     cursor = conn.cursor()
     
+    # ✅ FIXED: Updated INSERT statement to include file_type
     cursor.execute('''
-        INSERT INTO functions (repository_url, file_name, function_code, ai_summary)
-        VALUES (?, ?, ?, ?)
-    ''', (repo_url, file_name, code, ai_summary))
+        INSERT INTO functions (repo_url, file_name, file_type, function_name, function_code, ai_summary)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (repo_url, file_name, file_type, function_name, function_code, ai_summary))
     
     conn.commit()
     conn.close()
