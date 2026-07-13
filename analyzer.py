@@ -15,7 +15,7 @@ def analyze_code_chunk(function_name, file_name, code_text):
 
     Act as if you are the original architect and core developer of this entire codebase, as well as a highly experienced technical mentor. You know the "heart" of this code intimately, and you possess a gift for teaching complex logic to absolute beginners.
 
-    Analyze the following Python function extracted from `{file_name}`.
+    Analyze the following function extracted from `{file_name}`.
 
     Function Name: {function_name}
     Code:
@@ -52,6 +52,8 @@ def analyze_code_chunk(function_name, file_name, code_text):
     graph TD
         A["Start"] --> B("Process data")
     ```
+    IMPORTANT INSTURCTION: always check the length and the importance of the function and generate the summary length according to it 
+    don't make a very long summary for a small one or two liner function which is not that important.
     """
     
     # ==========================================
@@ -67,7 +69,7 @@ def analyze_code_chunk(function_name, file_name, code_text):
                 model = genai.GenerativeModel('gemini-2.5-flash')
                 response = model.generate_content(prompt)
                 # We add a tag so you know which AI answered in the database
-                return f"[☁️ Gemini] {response.text}"
+                return f"{response.text}"
                 
             except Exception as e:
                 # If we hit a rate limit, flip the global flag to True
@@ -90,7 +92,7 @@ def analyze_code_chunk(function_name, file_name, code_text):
         response = requests.post(url, json=payload)
         response.raise_for_status()
         result = response.json()
-        return f"[💻 Local] {result.get('response', 'No response generated.')}"
+        return f"{result.get('response', 'No response generated.')}"
         
     except Exception as e:
         return f"❌ CRITICAL: Both Cloud and Local AI Analysis Failed: {e}"
