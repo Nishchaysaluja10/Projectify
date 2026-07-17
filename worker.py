@@ -2,7 +2,9 @@
 import os
 import subprocess
 import tempfile
+# pyrefly: ignore [missing-import]
 from celery import Celery
+# pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
 
 # Import our new merged logic and database models

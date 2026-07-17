@@ -45,11 +45,20 @@ def _parse_python_frameworks(rel_path, content):
     results = []
     try:
         tree = PARSER.parse(content.encode('utf-8'))
+        captures_data = PY_QUERY.captures(tree.root_node)
         
-        # Updated capture loop to avoid unpacking errors
-        for capture in PY_QUERY.captures(tree.root_node):
-            node = capture[0]  # The actual syntax node
-            
+        # Safely extract nodes regardless of tree-sitter version
+        nodes_to_process = []
+        if isinstance(captures_data, dict):
+            # Modern tree-sitter: dictionary of lists
+            for nodes_list in captures_data.values():
+                nodes_to_process.extend(nodes_list)
+        else:
+            # Older tree-sitter: list of tuples
+            for capture in captures_data:
+                nodes_to_process.append(capture[0])
+
+        for node in nodes_to_process:
             name_node = node.child_by_field_name('name')
             name = content[name_node.start_byte:name_node.end_byte] if name_node else "Anonymous"
             code_block = content[node.start_byte:node.end_byte]
@@ -87,6 +96,7 @@ def _parse_python_frameworks(rel_path, content):
             "function_code": str(e)
         })
     return results
+    
 def _extract_brace_block(content, start_index):
     open_braces = 0
     in_string = False

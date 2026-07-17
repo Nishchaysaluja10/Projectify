@@ -1,6 +1,8 @@
 # trigger.py
 import requests
 import os
+import sys
+# pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
 
 # Load variables from the .env file
@@ -8,9 +10,13 @@ load_dotenv()
 
 github_url = os.getenv("GITHUB_URL")
 
+if not github_url:
+    print("❌ Error: GITHUB_URL not found in .env file.")
+    sys.exit(1)
+
 # The payload simulating what your outside backend will send
 payload = {
-    "github_url": "https://github.com/nishchaysaluja10/projectify"
+    "github_url": github_url
 }
 
 url = "http://127.0.0.1:5001/api/repositories"
