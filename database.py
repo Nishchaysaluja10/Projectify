@@ -1,32 +1,41 @@
-import sqlite3
+# database.py
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.dialects.postgresql import JSONB
+from datetime import datetime
 
-def init_db():
-    conn = sqlite3.connect('architecture_map.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS functions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            repo_url TEXT,
-            file_name TEXT,
-            file_type TEXT,        -- NEW: python, vue, sql, config
-            function_name TEXT, 
-            function_code TEXT,
-            ai_summary TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
+db = SQLAlchemy()
 
-# ✅ FIXED: Added file_type as a parameter to match the table schema
-def save_to_db(repo_url, file_name, file_type, function_name, function_code, ai_summary):
-    conn = sqlite3.connect('architecture_map.db')
-    cursor = conn.cursor()
+class Repository(db.Model):
+    __tablename__ = 'repositories'
     
-    # ✅ FIXED: Updated INSERT statement to include file_type
-    cursor.execute('''
-        INSERT INTO functions (repo_url, file_name, file_type, function_name, function_code, ai_summary)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (repo_url, file_name, file_type, function_name, function_code, ai_summary))
+    id = db.Column(db.Integer, primary_key=True)
+    github_url = db.Column(db.String(255), nullable=False, unique=True, index=True)
     
-    conn.commit()
-    conn.close()
+    # State tracking for the tree-sitter extraction process
+    status = db.Column(
+        db.Enum('pending_parsing', 'parsed', 'failed_parsing', name='repo_parsing_status'), 
+        default='pending_parsing'
+    )
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    # Cascade deletion: if a repo link is removed, wipe all its structural nodes
+    nodes = db.relationship('ProjectNode', backref='repository', lazy=True, cascade="all, delete-orphan")
+
+class ProjectNode(db.Model):
+    __tablename__ = 'project_nodes'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    repository_id = db.Column(db.Integer, db.ForeignKey('repositories.id', ondelete='CASCADE'), nullable=False)
+    
+    node_name = db.Column(db.String(255), nullable=False)
+    node_type = db.Column(db.Enum('global', 'class', 'function', name='node_type'), nullable=False)
+    
+    # Stores the raw code block corresponding to this specific structural node
+    code_content = db.Column(db.Text, nullable=False)
+    
+    # PostgreSQL JSONB column for structural relationships (inbound/outbound code edges)
+    # Example format: {"inbound_calls": ["fetchData"], "outbound_calls": ["renderGraph", "logError"]}
+    structural_metadata = db.Column(JSONB, nullable=True)
+    
+    # Composite index to instantly fetch structural nodes belonging to a specific repository
+    __table_args__ = (db.Index('idx_repo_nodes', 'repository_id', 'node_type'),)

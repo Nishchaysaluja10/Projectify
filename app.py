@@ -1,313 +1,144 @@
-import sqlite3
-import re
-import json
-from flask import Flask, render_template_string
+import os
+import requests
+import redis
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from database import db, Repository, ProjectNode
 
 app = Flask(__name__)
+CORS(app)
+# -------------------------------------------------------------------
+# 1. PostgreSQL Database Configuration
+# -------------------------------------------------------------------
+# Replace with your actual PostgreSQL credentials
+# app.py
+app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://postgres:Messi_10@localhost:5432/projectify_db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-def get_db_connection():
-    conn = sqlite3.connect('architecture_map.db')
-    conn.row_factory = sqlite3.Row  
-    return conn
+db.init_app(app)
 
-def clean_ai_summary(raw_text):
+# -------------------------------------------------------------------
+# 2. Redis Cache Configuration
+# -------------------------------------------------------------------
+# decode_responses=True ensures we get clean strings back, not raw bytes
+cache = redis.Redis(
+    host='localhost', 
+    port=6379, 
+    db=0, 
+    decode_responses=True
+)
+
+# -------------------------------------------------------------------
+# API Routes
+# -------------------------------------------------------------------
+
+@app.route('/api/repositories', methods=['POST'])
+def ingest_repository():
     """
-    Strips accidental JSON formatting and literal escaped characters
-    that were saved directly into the SQLite database.
+    Endpoint for your external backend to push a GitHub link here.
+    Registers the repo and triggers the background tree-sitter parser.
     """
-    if not raw_text:
-        return ""
+    data = request.json
+    github_url = data.get('github_url')
+    
+    if not github_url:
+        return jsonify({"error": "github_url is required"}), 400
+        
+    # Check if already exists
+    existing_repo = Repository.query.filter_by(github_url=github_url).first()
+    if existing_repo:
+        # Trigger Celery task even if it already exists, or maybe not? 
+        # Actually let's queue it so the background worker parses it if not done.
+        from worker import parse_repository_task
+        parse_repository_task.delay(existing_repo.id, github_url)
+        return jsonify({"message": "Repository already exists and queued for parsing", "repo_id": existing_repo.id}), 200
+
+    new_repo = Repository(github_url=github_url)
+    db.session.add(new_repo)
+    db.session.commit()
+    
+    # Push to Celery queue here to trigger git clone & tree-sitter parsing
+    from worker import parse_repository_task
+    parse_repository_task.delay(new_repo.id, github_url)
+    
+    return jsonify({"message": "Repository ingested and queued for parsing", "repo_id": new_repo.id}), 201
+
+@app.route('/api/repositories/<int:repo_id>/nodes', methods=['GET'])
+def get_repository_map(repo_id):
+    """
+    Returns the complete structural map of the repository so the Vue frontend 
+    can draw the visual nodes and edges instantly.
+    """
+    nodes = ProjectNode.query.filter_by(repository_id=repo_id).all()
+    
+    map_data = []
+    for node in nodes:
+        map_data.append({
+            "id": node.id,
+            "node_name": node.node_name,
+            "node_type": node.node_type,
+            "edges": node.structural_metadata # Returns the JSONB inbound/outbound links
+        })
+        
+    return jsonify({"repository_id": repo_id, "nodes": map_data}), 200
+
+@app.route('/api/node-summary/<int:node_id>', methods=['GET'])
+def get_node_summary(node_id):
+    """
+    The Lazy-Loading engine. Checks Redis first, falls back to Ollama.
+    """
+    cache_key = f"node_summary:{node_id}"
+    
+    # 1. Check RAM Cache (~1ms latency)
+    cached_summary = cache.get(cache_key)
+    if cached_summary:
+        return jsonify({"summary": cached_summary, "source": "redis_cache"}), 200
+        
+    # 2. Cache Miss: Fetch Node from PostgreSQL
+    node = ProjectNode.query.get_or_404(node_id)
+    
+    # Extract contextual edges from the JSONB column to feed the LLM
+    metadata = node.structural_metadata or {}
+    inbound_calls = metadata.get("inbound_calls", [])
+    outbound_calls = metadata.get("outbound_calls", [])
+    
+    # 3. Construct the Token-Optimized Prompt
+    prompt = f"""
+    System: You are a codebase teaching assistant. Explain this code block to a student. Output strictly a 2-sentence explanation. No markdown, no introductions.
+    Code: {node.code_content}
+    This block is CALLED BY: {inbound_calls}
+    This block CALLS: {outbound_calls}
+    
+    Provide a concise 2-sentence explanation:
+    1. What this code block handles internally.
+    2. How it bridges its callers to its dependencies.
+    """
+    
     try:
-        parsed = json.loads(raw_text)
-        if isinstance(parsed, list):
-            return "\n".join(parsed)
-        elif isinstance(parsed, str):
-            return parsed
-    except Exception:
-        pass
+        # 4. Query local Ollama instance
+        response = requests.post('http://localhost:11434/api/generate', json={
+            "model": "qwen2.5-coder:1.5b", # Fast, low-parameter model
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "num_ctx": 4096,
+                "num_predict": 150 # Hard cap on token generation
+            }
+        }, timeout=10)
         
-    cleaned = str(raw_text).replace('\\n', '\n').replace('\\"', '"').replace('\\t', '\t')
-    if cleaned.startswith('["') and cleaned.endswith('"]'):
-        cleaned = cleaned[2:-2]
-    return cleaned
+        response.raise_for_status()
+        generated_summary = response.json().get('response', '').strip()
+        
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": "Failed to generate summary via Ollama", "details": str(e)}), 500
 
-@app.route('/')
-def index():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, file_name, file_type, function_name, function_code, ai_summary FROM functions ORDER BY file_name")
-    rows = cursor.fetchall()
-    conn.close()
-
-    colors = {
-        'python': {'bg': '#064e3b', 'border': '#34d399'}, 
-        'vue': {'bg': '#4c1d95', 'border': '#8b5cf6'},    
-        'sql': {'bg': '#1e3a8a', 'border': '#3b82f6'},    
-        'config': {'bg': '#450a0a', 'border': '#ef4444'}  
-    }
-
-    repo_structure = {}
-    nodes = []
-    edges = []
-    processed_files = set()
+    # 5. Store in Redis for 24 hours (86400 seconds)
+    cache.setex(cache_key, 86400, generated_summary)
     
-    for row in rows:
-        file_name = row['file_name']
-        file_type = row['file_type'] or 'python'
-        code = row['function_code']
-        func_id = f"func_{row['id']}"
-        real_name = row['function_name'] or "Unnamed"
-        
-        clean_summary = clean_ai_summary(row['ai_summary'])
-        
-        if file_name not in repo_structure:
-            repo_structure[file_name] = []
-            
-        repo_structure[file_name].append({
-            'id': func_id,
-            'name': real_name
-        })
-        
-        if file_name not in processed_files:
-            nodes.append({"id": file_name, "label": f"📄 {file_name}", "shape": "box", "color": {"background": "#0f172a", "border": "#475569"}, "font": {"color": "#94a3b8"}})
-            processed_files.add(file_name)
-            
-        c = colors.get(file_type, {'bg': '#374151', 'border': '#6b7280'})
-        
-        nodes.append({
-            "id": func_id, "label": f"⚡ {real_name}", "shape": "box",
-            "color": {"background": c['bg'], "border": c['border']}, "font": {"color": "#f8fafc", "size": 12},
-            "file_name": file_name, "code": code, "summary": clean_summary
-        })
-        edges.append({"from": file_name, "to": func_id})
-
-    repo_tree = {'_files': []}
-    for fname, functions in repo_structure.items():
-        parts = fname.split('/')
-        curr = repo_tree
-        for part in parts[:-1]:
-            if part not in curr:
-                curr[part] = {'_files': []}
-            curr = curr[part]
-        curr['_files'].append({'name': parts[-1], 'functions': functions})
-
-    graph_data = {"nodes": nodes, "edges": edges}
-
-    # Standard System Architecture Template written in Markdown + Mermaid
-    system_architecture_md = """
-### 🏗️ Platform System Architecture
-This global diagram illustrates how data flows between the frontend client, the backend server, and the asynchronous task queues.
-
-```mermaid
-graph TD
-    Client[💻 Vue.js Client] -->|REST API Requests| API[⚡ Flask Backend]
-    
-    subgraph Backend Ecosystem
-        API -->|Read / Write| DB[(🗄️ MySQL Database)]
-        API -->|Enqueue Tasks| Broker((💨 Redis Broker))
-        Broker -->|Consume Tasks| Worker[⚙️ Celery Worker]
-        Worker -->|Update Status| DB
-    end
-
-"""
-
-    html_template = """
-<!DOCTYPE html>
-<html lang="en" class="h-full bg-neutral-950 text-neutral-200">
-<head>
-    <meta charset="UTF-8">
-    <title>🧠 Architecture Mind Map</title>
-    <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
-    <script src="https://cdn.tailwindcss.com?plugins=typography"></script>
-    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-</head>
-
-<body class="h-full flex flex-col" 
-      x-data="mindmapComponent()"
-      @open-node-view.window="openNode($event.detail.id)">
-    
-    <header class="border-b border-neutral-800 bg-neutral-900/50 px-6 py-4 flex items-center justify-between">
-        <span class="text-xl font-bold bg-gradient-to-r from-emerald-400 to-cyan-400 bg-clip-text text-transparent">CODEBASE MIND-MAP</span>
-        
-        <button @click="openSystemArchitecture()" 
-                class="bg-neutral-800 hover:bg-neutral-700 text-emerald-400 px-4 py-2 rounded-md text-sm font-bold border border-emerald-500/30 transition-colors flex items-center gap-2">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2 1.5 3 3.5 3S11 19 11 17V7c0-2-1.5-3-3.5-3S4 5 4 7zm10 0v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V7c0-2-1.5-3-3.5-3S14 5 14 7z"></path></svg>
-            View System Architecture
-        </button>
-    </header>
-
-    <div class="flex flex-1 overflow-hidden">
-        <aside class="w-80 border-r border-neutral-800 bg-neutral-900/20 overflow-y-auto p-4">
-            {% macro render_tree(node, depth=0) %}
-                {% for folder, content in node.items() %}
-                    {% if folder != '_files' %}
-                        <div class="mb-2" x-data="{ open: true }">
-                            <button @click="open = !open" class="flex items-center text-xs font-mono text-emerald-300 hover:text-emerald-400 mb-1" style="padding-left: {{ depth * 12 }}px">
-                                <svg x-show="!open" class="w-3 h-3 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
-                                <svg x-show="open" class="w-3 h-3 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
-                                📁 {{ folder }}
-                            </button>
-                            <div x-show="open">
-                                {{ render_tree(content, depth + 1) }}
-                            </div>
-                        </div>
-                    {% endif %}
-                {% endfor %}
-                {% if node.get('_files') %}
-                    {% for file in node['_files'] %}
-                    <div class="mb-2 bg-neutral-900/60 p-2 rounded-lg border border-neutral-800" style="margin-left: {{ depth * 12 }}px">
-                        <div class="text-emerald-400 text-xs font-mono mb-1 truncate" title="{{ file.name }}">📄 {{ file.name }}</div>
-                        {% for func in file.functions %}
-                        <button @click="openNode('{{ func.id }}')"
-                                class="w-full text-left px-2 py-1 text-xs font-mono text-neutral-400 hover:text-emerald-400 truncate">⚡ {{ func.name }}</button>
-                        {% endfor %}
-                    </div>
-                    {% endfor %}
-                {% endif %}
-            {% endmacro %}
-            {{ render_tree(tree) }}
-        </aside>
-
-        <main class="flex-1 bg-neutral-950 relative">
-            <div id="architecture-network" class="w-full h-full"></div>
-            
-            <template x-if="showPanel">
-                <div class="absolute inset-0 z-20 flex bg-neutral-950 divide-x divide-neutral-800">
-                    <template x-if="selectedCode">
-                        <section class="flex-1 overflow-auto p-4"><pre class="text-xs text-neutral-300" x-text="selectedCode"></pre></section>
-                    </template>
-                    
-                    <section :class="selectedCode ? 'w-[450px]' : 'flex-1 max-w-5xl mx-auto'" 
-                             class="overflow-auto p-6 prose prose-invert prose-emerald" 
-                             id="summary-container" x-html="selectedSummary"></section>
-                    
-                    <button @click="showPanel = false" class="absolute top-4 right-4 bg-neutral-800 px-3 py-1 rounded text-xs">Close</button>
-                </div>
-            </template>
-        </main>
-    </div>
-
-    <script>
-        mermaid.initialize({ startOnLoad: false, theme: 'dark' });
-
-        window.appGraphData = {{ graph_json | safe }};
-        window.appSysArch = {{ sys_arch_json | safe }}; 
-
-        document.addEventListener('alpine:init', () => {
-            Alpine.data('mindmapComponent', () => ({
-                showPanel: false, 
-                selectedCode: '', 
-                selectedSummary: '', 
-                selectedFile: '',
-                
-                openSystemArchitecture() {
-                    this.selectedCode = ''; 
-                    this.selectedSummary = marked.parse(window.appSysArch);
-                    this.showPanel = true;
-                    this.renderMermaid();
-                },
-
-                openNode(nodeId) {
-                    const node = window.appGraphData.nodes.find(n => n.id === nodeId);
-                    if (node && node.code) {
-                        this.selectedFile = node.file_name;
-                        this.selectedCode = node.code;
-                        
-                        let rawSummary = node.summary;
-                        if (!rawSummary || rawSummary.trim() === '' || rawSummary === 'null') {
-                            rawSummary = '### ⚠️ No AI Summary Available\\n\\nThe AI analysis pipeline did not return a summary for this file.';
-                        }
-                        
-                        try {
-                            this.selectedSummary = marked.parse(String(rawSummary));
-                        } catch (error) {
-                            const safeRawText = String(rawSummary).replace(/</g, '&lt;').replace(/>/g, '&gt;');
-                            this.selectedSummary = `<p class="text-red-400">Error rendering markdown.</p><pre class="text-xs text-neutral-500 mt-4 whitespace-pre-wrap">${safeRawText}</pre>`;
-                        }
-                        
-                        this.showPanel = true;
-                        this.renderMermaid();
-                    }
-                },
-
-                renderMermaid() {
-                    this.$nextTick(() => {
-                        const container = document.getElementById('summary-container');
-                        if (container) {
-                            const mermaidBlocks = container.querySelectorAll('code.language-mermaid');
-                            mermaidBlocks.forEach((el) => {
-                                const pre = el.parentElement;
-                                if (pre && pre.tagName === 'PRE') {
-                                    const div = document.createElement('div');
-                                    div.className = 'mermaid flex justify-center mt-6'; 
-                                    div.textContent = el.textContent;
-                                    pre.replaceWith(div);
-                                }
-                            });
-                        }
-
-                        if (window.mermaid) {
-                            mermaid.run({ querySelector: '.mermaid' }).catch(e => console.error("Mermaid error:", e));
-                        }
-                    });
-                }
-            }));
-        });
-
-        document.addEventListener('DOMContentLoaded', () => {
-                const data = { 
-                    nodes: new vis.DataSet(window.appGraphData.nodes), 
-                    edges: new vis.DataSet(window.appGraphData.edges) 
-                };
-                
-                // 🟢 SENIOR UI/UX FIX: The Archipelago Layout
-                const network = new vis.Network(document.getElementById('architecture-network'), data, { 
-                    layout: {
-                        improvedLayout: true
-                    },
-                    physics: {
-                        enabled: true,
-                        solver: 'repulsion', // Spreads nodes out to fill empty space
-                        repulsion: {
-                            nodeDistance: 180,      // Pushes different files away from each other
-                            centralGravity: 0.05,   // Gently pulls everything toward the center so nothing floats away
-                            springLength: 60,       // Pulls functions tightly to their parent file (creates neat clusters)
-                            springConstant: 0.05
-                        },
-                        stabilization: {
-                            enabled: true,
-                            iterations: 500,        // Pre-calculates the physics silently BEFORE showing the user
-                            fit: true               // Automatically frames the entire map perfectly on load
-                        }
-                    },
-                    edges: {
-                        smooth: {
-                            type: 'curvedCW',       // Gentle, modern curves
-                            roundness: 0.2
-                        },
-                        color: { color: '#475569', opacity: 0.7, highlight: '#34d399' },
-                        arrows: { to: { enabled: true, scaleFactor: 0.5 } } 
-                    },
-                    interaction: {
-                        hover: true,
-                        tooltipDelay: 200,
-                        zoomView: true
-                    }
-                });
-                
-                network.on("click", (p) => {
-                    if (p.nodes.length) {
-                        window.dispatchEvent(new CustomEvent('open-node-view', { detail: { id: p.nodes[0] } }));
-                    }
-                });
-            });
-    </script>
-</body>
-</html>
-"""
-    return render_template_string(html_template, structure=repo_structure, tree=repo_tree, graph_json=json.dumps(graph_data), sys_arch_json=json.dumps(system_architecture_md))
+    return jsonify({"summary": generated_summary, "source": "ollama_generation"}), 200
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    # Create tables if they don't exist (useful for initial local setup)
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True, port=5001)
